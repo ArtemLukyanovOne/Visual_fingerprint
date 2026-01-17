@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import argparse
 import base64
 import binascii
@@ -15,7 +13,6 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
 from PIL import Image, ImageTk
-
 
 # ----------------------------
 # Examples
@@ -66,9 +63,9 @@ class ArtMeta:
 
 @dataclass(frozen=True)
 class ParsedInput:
-    fingerprint: bytes           # numeric fingerprint (12..32 bytes) used as input to visual algorithm
-    kind: str                    # "hex-fingerprint" | "ssh-public-key" | "text" | "file-bytes"
-    details: str                 # for UI/CLI
+    fingerprint: bytes  # numeric fingerprint (12..32 bytes) used as input to visual algorithm
+    kind: str  # "hex-fingerprint" | "ssh-public-key" | "text" | "file-bytes"
+    details: str  # for UI/CLI
 
 
 # ----------------------------
@@ -168,7 +165,8 @@ def parse_user_input(s: str) -> ParsedInput:
         except binascii.Error as e:
             raise ValueError("Похоже на SSH public key, но base64 часть невалидна.") from e
         fp = hashlib.sha256(blob).digest()
-        return ParsedInput(fp, "ssh-public-key", f"SSH public key ({key_type}): blob={len(blob)} bytes → SHA-256 (32 bytes)")
+        return ParsedInput(fp, "ssh-public-key",
+                           f"SSH public key ({key_type}): blob={len(blob)} bytes → SHA-256 (32 bytes)")
 
     # 3) Text fallback
     raw = s.encode("utf-8")
@@ -198,7 +196,8 @@ def parse_file_input(path: str) -> ParsedInput:
             b64 = m.group(2)
             blob = base64.b64decode(b64, validate=True)
             fp = hashlib.sha256(blob).digest()
-            return ParsedInput(fp, "ssh-public-key", f"File SSH public key ({key_type}): blob={len(blob)} bytes → SHA-256 (32 bytes)")
+            return ParsedInput(fp, "ssh-public-key",
+                               f"File SSH public key ({key_type}): blob={len(blob)} bytes → SHA-256 (32 bytes)")
         # If file contains hex-ish fingerprint line
         if HEX_RE.fullmatch(text) is not None:
             return parse_user_input(text)
@@ -212,48 +211,39 @@ def parse_file_input(path: str) -> ParsedInput:
 # ----------------------------
 # Visual algorithm (Drunken Bishop adapted to 64x64) with HSV default
 # ----------------------------
-
 def fingerprint_image_from_fingerprint(
-    fp: bytes,
-    density_bytes: int,
-    density_name: str,
-    *,
-    size: int = 64,
-    mode: str = "hsv",   # "hsv" (default) or "gray"
+        fp: bytes,
+        density_bytes: int,
+        density_name: str,
+        *,
+        size: int = 64,
+        mode: str = "hsv",
 ) -> Tuple[Image.Image, ArtMeta]:
     """
-    fp: numeric fingerprint (12..32 bytes)
-    We normalize it to 32 bytes (seed) via SHA-256, then stretch via SHAKE-256 to get enough commands.
-
-    Random walk:
-      Each byte => 4 diagonal moves (2 bits per move), OpenSSH-style:
-        bit0 -> x sign, bit1 -> y sign
-      Field is torus (wrap-around).
-
-    We accumulate:
-      - intensity grid (int)
-      - vector field (vx, vy) based on movement direction at each visited cell (float)
-
-    Rendering:
-      - Value (V) from intensity (log + gamma) => preserves shape and contrast
-      - Hue (H) from atan2(vy, vx) => dominant direction in each region
-      - Saturation (S) from coherence = |v| / visits, also damped in low-intensity zones to avoid "acid"
+    Создает тепловую карту (heatmap) с плавными градиентами.
+    Основные принципы:
+    1. Яркость (Value) соответствует логарифмической интенсивности
+    2. Оттенок (Hue) плавно меняется от холодного к теплому вместе с яркостью
+    3. Насыщенность (Saturation) высокая, но контролируемая для естественных цветов
+    4. Гауссово размытие для плавных переходов
+    5. Фоновый градиент для заполнения пустых областей
     """
     if not (12 <= len(fp) <= 32):
         raise ValueError(f"fingerprint must be 12..32 bytes, got {len(fp)}")
 
-    seed = hashlib.sha256(fp).digest()   # stable 32-byte seed
+    seed = hashlib.sha256(fp).digest()
     sha_hex = seed.hex()
     tag = _make_tag(seed)
 
-    # Style params
-    gamma = 0.65 + (seed[1] / 255) * 0.20
+    # Стилевые параметры из seed
+    gamma = 0.7 + (seed[1] / 255) * 0.25  # Более мягкая гамма
     stamp_kind = seed[2] & 3
-    max_level = 140
+    max_level = 120  # Уменьшаем максимальный уровень для более плавных переходов
 
-    # Stretch (KDF)
+    # KDF для расширения потока
     stream = hashlib.shake_256(seed).digest(density_bytes)
 
+    # Инициализация сеток
     intensity: List[List[int]] = [[0] * size for _ in range(size)]
     visits: List[List[int]] = [[0] * size for _ in range(size)]
     vx: List[List[float]] = [[0.0] * size for _ in range(size)]
@@ -264,57 +254,50 @@ def fingerprint_image_from_fingerprint(
         intensity[y][x] = max_level if v > max_level else v
 
     def stamp(x: int, y: int) -> None:
-        # main thickness
-        inc_int(x, y, 3)
+        inc_int(x, y, 2)  # Уменьшаем основной вклад для более тонких линий
 
+        # Более мягкие штампы для плавности
         if stamp_kind == 0:
-            inc_int((x + 1) % size, y, 1); inc_int((x - 1) % size, y, 1)
-            inc_int(x, (y + 1) % size, 1); inc_int(x, (y - 1) % size, 1)
+            inc_int((x + 1) % size, y, 1)
+            inc_int((x - 1) % size, y, 1)
         elif stamp_kind == 1:
-            inc_int((x + 1) % size, (y + 1) % size, 1); inc_int((x - 1) % size, (y - 1) % size, 1)
-            inc_int((x + 1) % size, (y - 1) % size, 1); inc_int((x - 1) % size, (y + 1) % size, 1)
+            inc_int((x + 1) % size, (y + 1) % size, 1)
+            inc_int((x - 1) % size, (y - 1) % size, 1)
         elif stamp_kind == 2:
-            for dy0 in (-1, 0, 1):
-                for dx0 in (-1, 0, 1):
-                    inc_int((x + dx0) % size, (y + dy0) % size, 1)
+            inc_int((x + 1) % size, y, 1)
+            inc_int(x, (y + 1) % size, 1)
         else:
-            inc_int((x + 1) % size, y, 1); inc_int(x, (y + 1) % size, 1)
+            pass  # Минимальный штамп
 
     def draw_marker(mx0: int, my0: int, kind: int) -> None:
-        # anchors: affect intensity only (do not affect direction field)
-        if kind == 0:
-            for dy0 in range(-2, 3):
-                for dx0 in range(-2, 3):
-                    if abs(dx0) == 2 or abs(dy0) == 2:
-                        inc_int((mx0 + dx0) % size, (my0 + dy0) % size, 7)
-        else:
-            for dy0 in range(-3, 4):
-                for dx0 in range(-3, 4):
-                    if abs(dx0) + abs(dy0) == 3:
-                        inc_int((mx0 + dx0) % size, (my0 + dy0) % size, 7)
+        # Мягкие метки для структурных элементов
+        for dy0 in range(-2, 3):
+            for dx0 in range(-2, 3):
+                distance = abs(dx0) + abs(dy0)
+                if distance <= 2:
+                    inc_int((mx0 + dx0) % size, (my0 + dy0) % size, 5 - distance)
 
-    # Place 4 anchors
+    # Размещаем структурные элементы
     markers: List[Tuple[int, int]] = []
     for i in range(4):
         mx0 = (seed[4 + i] * 17 + stream[10 + i]) % size
         my0 = (seed[12 + i] * 29 + stream[30 + i]) % size
-        for _ in range(12):
-            if all((mx0 - px) ** 2 + (my0 - py) ** 2 >= 140 for px, py in markers):
+        for _ in range(8):
+            if all((mx0 - px) ** 2 + (my0 - py) ** 2 >= 100 for px, py in markers):
                 break
-            mx0 = (mx0 + 13) % size
-            my0 = (my0 + 31) % size
+            mx0 = (mx0 + 17) % size
+            my0 = (my0 + 23) % size
         markers.append((mx0, my0))
         draw_marker(mx0, my0, i & 1)
 
-    # Walk from center
+    # Начинаем обход из центра
     x = y = size // 2
     start = (x, y)
 
-    # Initialize at start
     visits[y][x] += 1
     stamp(x, y)
 
-    # Each byte => 4 moves
+    # Случайное блуждание
     for byte in stream:
         inp = byte
         for _ in range(4):
@@ -324,7 +307,6 @@ def fingerprint_image_from_fingerprint(
             x = _wrap(x + dx, size)
             y = _wrap(y + dy, size)
 
-            # Record visit and direction at the visited cell (core channel for HSV)
             visits[y][x] += 1
             vx[y][x] += float(dx)
             vy[y][x] += float(dy)
@@ -334,7 +316,7 @@ def fingerprint_image_from_fingerprint(
 
     end = (x, y)
 
-    # Center by intensity center-of-mass (then apply same shift to visits and vector fields)
+    # Центрирование
     dxs, dys = _center_of_mass_shift(intensity)
     if dxs or dys:
         intensity = _shift_grid_int(intensity, dxs, dys)
@@ -344,12 +326,11 @@ def fingerprint_image_from_fingerprint(
         start = (_wrap(start[0] + dxs, size), _wrap(start[1] + dys, size))
         end = (_wrap(end[0] + dxs, size), _wrap(end[1] + dys, size))
 
-    # Prepare normalization
+    # Нормализация интенсивности
     vmax = max(max(row) for row in intensity) or 1
-    vvis_max = max(max(row) for row in visits) or 1
 
-    # Render
     if mode.lower() == "gray":
+        # Градации серого (оставляем как было)
         img = Image.new("L", (size, size), 255)
         for yy in range(size):
             for xx in range(size):
@@ -362,62 +343,127 @@ def fingerprint_image_from_fingerprint(
                     shade = 255 - int(norm * 240)
                     shade = 0 if shade < 0 else (255 if shade > 255 else shade)
                 img.putpixel((xx, yy), shade)
-        img = img.convert("RGB")  # unify output type (RGB) for saving
+        img = img.convert("RGB")
         mode_name = "Grayscale"
     else:
-        # HSV (default)
-        img = Image.new("RGB", (size, size), (255, 255, 255))
-        eps = 1e-9
+        # СОЗДАЕМ НАСТОЯЩУЮ ТЕПЛОВУЮ КАРТУ
+        img = Image.new("RGB", (size, size))
+
+        # 1. Параметры тепловой карты (настраиваемые)
+        H_COLD = 0.7  # Фиолетовый
+        H_WARM = 0.0  # Красно-оранжевый
+        SATURATION = 0.85
+        V_MIN = 0.12
+        V_MAX = 0.95
+
+        # 2. Создаем плавное поле интенсивности с гауссовым размытием
+        # Сначала нормализуем интенсивность
+        normalized = [[0.0] * size for _ in range(size)]
+        for yy in range(size):
+            for xx in range(size):
+                v = intensity[yy][xx]
+                if v <= 0:
+                    normalized[yy][xx] = 0.0
+                else:
+                    # Логарифмическая нормализация + гамма-коррекция
+                    norm = math.log1p(v) / math.log1p(vmax)
+                    normalized[yy][xx] = norm ** gamma
+
+        # 3. Применяем простое размытие для плавности
+        smoothed = [[0.0] * size for _ in range(size)]
+        kernel = [(0, 0, 0.4), (-1, 0, 0.15), (1, 0, 0.15), (0, -1, 0.15), (0, 1, 0.15)]
 
         for yy in range(size):
             for xx in range(size):
-                iv = intensity[yy][xx]
-                if iv <= 0:
-                    img.putpixel((xx, yy), (255, 255, 255))
-                    continue
+                total = 0.0
+                weight_sum = 0.0
+                for dy, dx, weight in kernel:
+                    ny = (yy + dy) % size
+                    nx = (xx + dx) % size
+                    total += normalized[ny][nx] * weight
+                    weight_sum += weight
+                smoothed[yy][xx] = total / weight_sum
 
-                # Value from intensity (as before)
-                vnorm = math.log1p(iv) / math.log1p(vmax)
-                vnorm = vnorm ** gamma
-                V = 0.10 + 0.90 * vnorm  # keep some brightness range, avoid too dark washout
+        # 4. Добавляем фоновый радиальный градиент
+        center_x, center_y = size // 2, size // 2
+        max_dist = math.sqrt(center_x ** 2 + center_y ** 2)
 
-                # Hue from direction vector
-                ax = vx[yy][xx]
-                ay = vy[yy][xx]
-                angle = math.atan2(ay, ax)  # [-pi, pi]
-                H = (angle / (2.0 * math.pi)) % 1.0
+        for yy in range(size):
+            for xx in range(size):
+                # Текущее значение интенсивности
+                intensity_val = smoothed[yy][xx]
 
-                # Saturation from coherence:
-                # coherence ~ |sum(dir)| / visits  => 0..1 (0 -> chaotic, 1 -> consistent direction)
-                n = float(visits[yy][xx]) + eps
-                mag = math.sqrt(ax * ax + ay * ay)
-                coherence = mag / n
-                if coherence > 1.0:
-                    coherence = 1.0
+                # Радиальный градиент от центра
+                dx = xx - center_x
+                dy = yy - center_y
+                distance = math.sqrt(dx * dx + dy * dy)
+                radial = 1.0 - (distance / max_dist) * 0.3  # Слабый градиент
 
-                # Damp saturation in low-intensity regions to avoid "acid noise"
-                # (makes color appear where structure is strong)
-                vis_norm = math.log1p(visits[yy][xx]) / math.log1p(vvis_max)
-                S = (coherence ** 0.70) * (vis_norm ** 0.45) * 0.85
+                # Комбинируем интенсивность с радиальным градиентом
+                combined = intensity_val * 0.7 + radial * 0.3
 
-                # Clamp
-                if S < 0.0:
-                    S = 0.0
-                if S > 1.0:
-                    S = 1.0
+                # Яркость: от V_MIN до V_MAX
+                V = V_MIN + combined * (V_MAX - V_MIN)
 
+                # Оттенок: плавно меняется от холодного к теплому
+                # Используем комбинацию интенсивности и положения
+                intensity_factor = intensity_val
+                radial_factor = 1.0 - radial
+
+                # Вес интенсивности выше для горячих зон
+                if intensity_val > 0.5:
+                    blend = intensity_factor * 0.8 + radial_factor * 0.2
+                else:
+                    blend = intensity_factor * 0.4 + radial_factor * 0.6
+
+                H = H_COLD + blend * (H_WARM - H_COLD)
+                if H < 0:
+                    H += 1.0
+
+                # Насыщенность: постоянная высокая, но контролируемая
+                S = SATURATION
+
+                # Корректируем насыщенность для экстремальных значений
+                if V > 0.9:
+                    S = SATURATION * 0.8  # Слегка приглушаем очень светлые области
+                elif V < 0.3:
+                    S = SATURATION * 0.9  # Темные области чуть менее насыщенные
+
+                # Преобразуем HSV в RGB
                 r, g, b = colorsys.hsv_to_rgb(H, S, V)
+
+                # Легкая коррекция для более естественных цветов
+                # Уменьшаем кислотность зеленых тонов
+                if 0.25 < H < 0.45:  # Зеленая область
+                    g = g * 0.95
+                    r = r * 1.05
+
+                # Ограничиваем значения
+                r = min(max(r, 0.0), 1.0)
+                g = min(max(g, 0.0), 1.0)
+                b = min(max(b, 0.0), 1.0)
+
                 img.putpixel((xx, yy), (int(r * 255), int(g * 255), int(b * 255)))
 
-        mode_name = "HSV"
+        mode_name = "Heatmap (smooth gradient)"
 
-    # Mark start/end with black crosses on top
-    def cross(px: int, py: int) -> None:
+    # Отмечаем начало и конец (тонко, чтобы не нарушать градиент)
+    def subtle_cross(px: int, py: int, color_idx: int) -> None:
+        # Тонкие метки в стиле тепловой карты
+        colors = [(30, 30, 30), (60, 60, 60)]  # Темно-серые, а не черные
+        color = colors[color_idx]
         for dx0, dy0 in [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)]:
-            img.putpixel(((px + dx0) % size, (py + dy0) % size), (0, 0, 0))
+            current = img.getpixel(((px + dx0) % size, (py + dy0) % size))
+            # Смешиваем с текущим цветом для тонкости
+            mixed = (
+                int(current[0] * 0.7 + color[0] * 0.3),
+                int(current[1] * 0.7 + color[1] * 0.3),
+                int(current[2] * 0.7 + color[2] * 0.3)
+            )
+            img.putpixel(((px + dx0) % size, (py + dy0) % size), mixed)
 
-    cross(start[0], start[1])
-    cross(end[0], end[1])
+    subtle_cross(start[0], start[1], 0)
+    subtle_cross(end[0], end[1], 1)
 
     meta = ArtMeta(
         sha256_hex=sha_hex,
